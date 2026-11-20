@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     device_heartbeat_timeout_s: int = Field(default=90, ge=2, le=900)
     websocket_max_messages_per_minute: int = Field(default=120, ge=1, le=10000)
     websocket_max_protocol_strikes: int = Field(default=3, ge=1, le=20)
+    audio_websocket_path: str = "/ws/audio"
+    audio_max_chunk_bytes: int = Field(default=3200, ge=320, le=32000)
+    audio_max_duration_s: int = Field(default=30, ge=1, le=300)
+    audio_sample_rate: int = Field(default=16000, ge=8000, le=48000)
+    audio_channels: int = Field(default=1, ge=1, le=2)
+    audio_format: str = "pcm_s16le"
+    audio_chunk_timeout_s: float = Field(default=5.0, gt=0, le=60)
 
     model_config = SettingsConfigDict(
         env_prefix="DESKBOT_",
