@@ -11,7 +11,6 @@ constexpr uint32_t kSampleRate = 16000;
 constexpr size_t kBufferSamples = 32000;   // 2 seconds @ 16 kHz, mono PCM16
 constexpr size_t kReadFrames = 512;        // I2S frames per read / write (stereo 32-bit)
 constexpr uint32_t kReportIntervalMs = 1000;
-constexpr size_t kDrainReads = 1;          // drain reads after re-enabling RX
 constexpr uint32_t kTxWriteTimeoutMs = 100; // per-attempt timeout for TX writes
 constexpr size_t kTxMaxRetries = 8;         // max retries for a short/failed TX write
 
@@ -22,7 +21,6 @@ enum class AudioState {
 
 I2SClass i2s;
 bool i2s_initialized = false;
-bool rx_enabled = false;                   // RX channel currently enabled (capturing)?
 bool tx_stalled = false;                   // TX write stalled (consecutive failures)
 AudioState current_state = AudioState::LISTENING;
 uint32_t last_report_ms = 0;
@@ -66,47 +64,10 @@ const char *stateName(AudioState s) {
     return "UNKNOWN";
 }
 
-// RX enable/disable wrap the IDF channel lifecycle directly. The Arduino I2S
-// wrapper exposes no public, clock-safe independent channel enable/disable, so
-// the IDF calls are used on the handle obtained via i2s.rxChan().
-//
-// Lifecycle requirements (verified in esp_driver_i2s/i2s_common.c):
-//   i2s_channel_disable() requires the channel state == RUNNING, transitions to
-//   READY, waits for any in-progress read to quit, stops DMA and resets the RX
-//   queue. i2s_channel_enable() requires state == READY, restarts DMA, resets
-//   the RX queue (drains stale samples) and returns to RUNNING.
-//
-// Architecture note (ESP32 HW v1, IDF 6.1): in full-duplex STD mode
-// i2s_std_set_slot() calls i2s_ll_share_bck_ws(true), which makes RX slave to
-// TX's BCLK/WS (conf.sig_loopback). TX is the clock master. Disabling TX
-// (i2s_channel_disable on the TX channel -> i2s_ll_tx_stop, tx_start=0) stops
-// the shared BCLK/WS clock, so RX reads time out (ESP_ERR_TIMEOUT) and the
-// disable/enable race can surface ESP_ERR_INVALID_STATE. TX is therefore never
-// disabled: it stays enabled as the shared-clock master for the entire run.
-// RX alone is gated to start/stop microphone capture. This is genuine
-// half-duplex for the microphone path (capture is stopped during playback);
-// TX cannot be stopped without stopping the clock RX depends on.
-esp_err_t rxEnable() {
-    if (i2s.rxChan() == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t err = i2s_channel_enable(i2s.rxChan());
-    if (err == ESP_OK) {
-        rx_enabled = true;
-    }
-    return err;
-}
-
-esp_err_t rxDisable() {
-    if (i2s.rxChan() == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t err = i2s_channel_disable(i2s.rxChan());
-    if (err == ESP_OK) {
-        rx_enabled = false;
-    }
-    return err;
-}
+// Keep RX and TX enabled for the entire run. During PLAYING, RX is actively
+// drained and its samples discarded; they are never converted or recorded.
+// This preserves full-duplex clocks and DMA while the application behaves
+// half-duplex (it does not listen to or process mic input during playback).
 
 // Verify TX channel is still enabled (RUNNING). Returns true if TX can accept
 // writes. Logs if TX is not enabled, which would indicate the shared clock
@@ -129,86 +90,72 @@ bool txEnabled() {
     return info.is_enabled;
 }
 
-// Write all requested bytes to TX with bounded retries. Returns total bytes
-// actually written. Every short/failed attempt is logged with requested vs
-// actual bytes, lastError, and timeout status. Never silently discards audio.
+// Use the IDF API directly rather than I2SClass::write(). Arduino-ESP32
+// 3.3.12's wrapper returns its accumulated count on an IDF error but does not
+// add bytes_sent from the failing call before returning. The IDF API exposes
+// bytes_written even on a timeout, preventing silent loss/counter divergence.
+// The IDF timeout argument is milliseconds.
 size_t txWriteAll(const void *buffer, size_t size) {
-    const uint8_t *data = (const uint8_t *)buffer;
+    const uint8_t *data = static_cast<const uint8_t *>(buffer);
     size_t total_written = 0;
     size_t retries = 0;
-
     while (total_written < size) {
-        size_t remaining = size - total_written;
-        size_t bytes_written = i2s.write(data + total_written, remaining);
-        int tx_err = i2s.lastError();
+        const size_t remaining = size - total_written;
+        size_t bytes_written = 0;
+        esp_err_t tx_err = i2s_channel_write(
+            i2s.txChan(),
+            reinterpret_cast<char *>(const_cast<uint8_t *>(data + total_written)),
+            remaining, &bytes_written, kTxWriteTimeoutMs);
         tx_writes++;
-
-        if (bytes_written > 0) {
-            total_written += bytes_written;
-            retries = 0;  // progress made, reset retry count
+        if (bytes_written > remaining) {
+            Serial.printf("[LOOPBACK] ERROR: impossible TX byte count %u > %u\n",
+                          (unsigned)bytes_written, (unsigned)remaining);
+            tx_write_errors++;
+            tx_stalled = true;
+            tx_stall_events++;
+            break;
+        }
+        if (bytes_written > 0) total_written += bytes_written;
+        if (tx_err == ESP_OK && bytes_written == remaining) {
+            retries = 0;
             continue;
         }
-
-        // Zero bytes written: error or timeout. Log in detail.
         tx_write_errors++;
         tx_short_writes++;
         retries++;
         tx_retries++;
-
-        Serial.printf("[LOOPBACK] TX write stalled: requested=%u written=%u err=%d (%s) attempt=%u/%u\n",
+        Serial.printf("[LOOPBACK] TX write incomplete: requested=%u actual=%u err=%d (%s) attempt=%u/%u\n",
                       (unsigned)remaining, (unsigned)bytes_written, tx_err,
-                      esp_err_to_name((esp_err_t)tx_err), (unsigned)retries, (unsigned)kTxMaxRetries);
-
+                      esp_err_to_name(tx_err), (unsigned)retries, (unsigned)kTxMaxRetries);
+        if (total_written >= size) break;
         if (retries >= kTxMaxRetries) {
             tx_stalled = true;
             tx_stall_events++;
-            Serial.printf("[LOOPBACK] TX stalled after %u retries, %u bytes still pending\n",
-                          (unsigned)kTxMaxRetries, (unsigned)remaining);
+            Serial.printf("[LOOPBACK] TX stalled after %u retries, %u bytes pending\n",
+                          (unsigned)kTxMaxRetries, (unsigned)(size - total_written));
             break;
         }
-
-        // Brief yield to allow DMA to return buffers to the queue before retrying.
-        yield();
+        vTaskDelay(2);
     }
-
     tx_write_bytes += total_written;
     return total_written;
 }
 
 void transitionTo(AudioState new_state) {
-    if (current_state == new_state) {
-        return;
-    }
+    if (current_state == new_state) return;
     AudioState prev_state = current_state;
     current_state = new_state;
     state_transitions++;
     last_transition_ms = millis();
     Serial.printf("[LOOPBACK] Transition %s -> %s\n", stateName(prev_state), stateName(new_state));
-
     uint32_t now = millis();
     if (new_state == AudioState::PLAYING) {
-        // Required behavior #2: stop microphone capture before playback.
-        esp_err_t err = rxDisable();
-        Serial.printf("[LOOPBACK] RX disabled (stop mic capture): err=%d (%s)\n",
-                      err, esp_err_to_name(err));
-        // Verify TX is still enabled after RX disable (shared clock check).
-        Serial.printf("[LOOPBACK] TX enabled after RX disable: %s\n",
-                      txEnabled() ? "yes" : "NO");
+        Serial.println("[LOOPBACK] Playback started; RX remains active and will be discarded");
+        Serial.printf("[LOOPBACK] TX channel enabled: %s\n", txEnabled() ? "yes" : "NO");
         samples_played = 0;
         playback_start_ms = now;
         tx_stalled = false;
-        Serial.println("[LOOPBACK] Playback started");
     } else {
-        // Required behavior #4: stop playback and resume microphone capture.
-        esp_err_t err = rxEnable();
-        Serial.printf("[LOOPBACK] RX enabled (resume mic capture): err=%d (%s)\n",
-                      err, esp_err_to_name(err));
-        // Drain any stale RX samples left in the DMA pipe before capturing.
-        for (size_t d = 0; d < kDrainReads; ++d) {
-            size_t nb = i2s.readBytes((char *)rx_raw32, sizeof(rx_raw32));
-            rx_drain_reads++;
-            (void)nb;
-        }
         samples_recorded = 0;
         recording_start_ms = now;
         Serial.println("[LOOPBACK] Recording started");
@@ -234,9 +181,7 @@ void loopbackTestBegin() {
     i2s.setPins(26, 25, 22, 33);
 
     Serial.println("[LOOPBACK] Initializing I2S: Standard Philips, 16 kHz, 32-bit stereo, RX + TX");
-    Serial.println("[LOOPBACK] Architecture: TX is the shared-clock master and stays enabled always;");
-    Serial.println("[LOOPBACK] RX is gated on/off to start/stop microphone capture. Disabling TX would");
-    Serial.println("[LOOPBACK] stop the shared BCLK/WS clock (RX loops back TX's clock) and break RX.");
+    Serial.println("[LOOPBACK] Architecture: RX + TX remain enabled; PLAYING drains and discards RX samples.");
 
     if (!i2s.begin(I2S_MODE_STD, kSampleRate, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO, -1)) {
         Serial.printf("[LOOPBACK] ERROR: I2S begin() failed! lastError=%d (%s)\n",
@@ -261,7 +206,6 @@ void loopbackTestBegin() {
                   (unsigned long)i2s.rxSampleRate(), i2s.rxDataWidth(), i2s.rxSlotMode());
 
     i2s_initialized = true;
-    rx_enabled = true;   // begin() enables both channels (RUNNING)
     samples_recorded = 0;
     samples_played = 0;
     tx_stalled = false;
@@ -303,13 +247,6 @@ void loopbackTestLoop() {
 
     switch (current_state) {
         case AudioState::LISTENING: {
-            // Ensure the microphone is capturing.
-            if (!rx_enabled) {
-                esp_err_t err = rxEnable();
-                Serial.printf("[LOOPBACK] RX re-enabled: err=%d (%s)\n",
-                              err, esp_err_to_name(err));
-            }
-
             // --- Capture: read microphone (RX) ---
             size_t bytes_read = i2s.readBytes((char *)rx_raw32, sizeof(rx_raw32));
             int rx_err = i2s.lastError();
@@ -371,7 +308,20 @@ void loopbackTestLoop() {
         }
 
         case AudioState::PLAYING: {
-            // RX is disabled here: microphone capture is stopped during playback.
+            // Keep RX DMA drained while playing. Mic samples are intentionally
+            // discarded and never converted or appended to recording_buffer.
+            size_t rx_bytes = 0;
+            esp_err_t rx_err = i2s_channel_read(
+                i2s.rxChan(), reinterpret_cast<char *>(rx_raw32), sizeof(rx_raw32),
+                &rx_bytes, kTxWriteTimeoutMs);
+            rx_drain_reads++;
+            if (rx_err == ESP_ERR_TIMEOUT) {
+                rx_read_timeouts++;
+            } else if (rx_err != ESP_OK) {
+                rx_read_errors++;
+                Serial.printf("[LOOPBACK] RX discard read error: %d (%s), bytes=%u\n",
+                              rx_err, esp_err_to_name(rx_err), (unsigned)rx_bytes);
+            }
             if (!txEnabled()) {
                 Serial.printf("[LOOPBACK] ERROR: TX not enabled in PLAYING state, skipping write\n");
                 break;
@@ -417,6 +367,14 @@ void loopbackTestLoop() {
         }
     }
 
+    // Do not leave the state machine retrying forever after a bounded TX stall.
+    // Stop the audio subsystem cleanly; a reset/reinitialization is required.
+    if (tx_stalled) {
+        Serial.println("[LOOPBACK] FATAL: TX DMA made no progress; stopping loopback until reset.");
+        loopbackTestEnd();
+        return;
+    }
+
     // --- Periodic statistics report ---
     if (now - last_report_ms >= kReportIntervalMs) {
         uint32_t free_heap = ESP.getFreeHeap();
@@ -458,12 +416,6 @@ void loopbackTestEnd() {
         return;
     }
 
-    // Stop microphone capture before tearing down.
-    if (rx_enabled) {
-        esp_err_t err = rxDisable();
-        Serial.printf("[LOOPBACK] RX disabled on end: err=%d (%s)\n", err, esp_err_to_name(err));
-    }
-
     i2s.end();
 
     if (recording_buffer != nullptr) {
@@ -471,7 +423,6 @@ void loopbackTestEnd() {
         recording_buffer = nullptr;
     }
     i2s_initialized = false;
-    rx_enabled = false;
     tx_stalled = false;
     Serial.println("[LOOPBACK] Stopped");
 }
