@@ -4,6 +4,18 @@
 #include "network/time_sync.h"
 #include "network/wifi_manager.h"
 
+#ifdef DESKBOT_AUDIO_SPEAKER_TEST
+#include "audio/speaker_test.h"
+#endif
+
+#ifdef DESKBOT_AUDIO_MIC_TEST
+#include "audio/mic_test.h"
+#endif
+
+#ifdef DESKBOT_AUDIO_LOOPBACK_TEST
+#include "audio/loopback_test.h"
+#endif
+
 void setup() {
   Serial.begin(115200);
 
@@ -21,9 +33,34 @@ void setup() {
   DeskbotWiFi::begin();
   DeskbotTime::begin();
   DeskbotWebSocket::begin();
+
+#ifdef DESKBOT_AUDIO_SPEAKER_TEST
+  DeskbotAudio::speakerTestBegin();
+#endif
+
+#ifdef DESKBOT_AUDIO_MIC_TEST
+  DeskbotAudio::micTestBegin();
+#endif
+
+#ifdef DESKBOT_AUDIO_LOOPBACK_TEST
+  DeskbotAudio::loopbackTestBegin();
+#endif
 }
 
 void loop() {
   DeskbotWiFi::loop();
+
+#ifdef DESKBOT_AUDIO_SPEAKER_TEST
+  DeskbotAudio::speakerTestLoop();
+#endif
+
+#ifdef DESKBOT_AUDIO_MIC_TEST
+  DeskbotAudio::micTestLoop();
+#endif
+
+#ifdef DESKBOT_AUDIO_LOOPBACK_TEST
+  DeskbotAudio::loopbackTestLoop();
+#endif
+
   yield();
 }
