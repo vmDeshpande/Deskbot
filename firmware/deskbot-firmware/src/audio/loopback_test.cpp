@@ -105,7 +105,7 @@ size_t txWriteAll(const void *buffer, size_t size) {
         esp_err_t tx_err = i2s_channel_write(
             i2s.txChan(),
             reinterpret_cast<char *>(const_cast<uint8_t *>(data + total_written)),
-            remaining, &bytes_written, pdMS_TO_TICKS(kTxWriteTimeoutMs));
+            remaining, &bytes_written, kTxWriteTimeoutMs);
         tx_writes++;
         if (bytes_written > remaining) {
             Serial.printf("[LOOPBACK] ERROR: impossible TX byte count %u > %u\\n",
@@ -124,18 +124,18 @@ size_t txWriteAll(const void *buffer, size_t size) {
         tx_short_writes++;
         retries++;
         tx_retries++;
-        Serial.printf("[LOOPBACK] TX write incomplete: requested=%u actual=%u err=%d (%s) attempt=%u/%u\\n",
+        Serial.printf("[LOOPBACK] TX write incomplete: requested=%u actual=%u err=%d (%s) attempt=%u/%u\n",
                       (unsigned)remaining, (unsigned)bytes_written, tx_err,
                       esp_err_to_name(tx_err), (unsigned)retries, (unsigned)kTxMaxRetries);
         if (total_written >= size) break;
         if (retries >= kTxMaxRetries) {
             tx_stalled = true;
             tx_stall_events++;
-            Serial.printf("[LOOPBACK] TX stalled after %u retries, %u bytes pending\\n",
+            Serial.printf("[LOOPBACK] TX stalled after %u retries, %u bytes pending\n",
                           (unsigned)kTxMaxRetries, (unsigned)(size - total_written));
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(2);
     }
     tx_write_bytes += total_written;
     return total_written;
@@ -319,7 +319,7 @@ void loopbackTestLoop() {
                 rx_read_timeouts++;
             } else if (rx_err != ESP_OK) {
                 rx_read_errors++;
-                Serial.printf("[LOOPBACK] RX discard read error: %d (%s), bytes=%u\\n",
+                Serial.printf("[LOOPBACK] RX discard read error: %d (%s), bytes=%u\n",
                               rx_err, esp_err_to_name(rx_err), (unsigned)rx_bytes);
             }
             if (!txEnabled()) {
@@ -365,6 +365,14 @@ void loopbackTestLoop() {
             }
             break;
         }
+    }
+
+    // Do not leave the state machine retrying forever after a bounded TX stall.
+    // Stop the audio subsystem cleanly; a reset/reinitialization is required.
+    if (tx_stalled) {
+        Serial.println("[LOOPBACK] FATAL: TX DMA made no progress; stopping loopback until reset.");
+        loopbackTestEnd();
+        return;
     }
 
     // --- Periodic statistics report ---
