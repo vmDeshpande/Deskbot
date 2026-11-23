@@ -94,7 +94,7 @@ bool txEnabled() {
 // 3.3.12's wrapper returns its accumulated count on an IDF error but does not
 // add bytes_sent from the failing call before returning. The IDF API exposes
 // bytes_written even on a timeout, preventing silent loss/counter divergence.
-// Its timeout is in FreeRTOS ticks.
+// The IDF timeout argument is milliseconds.
 size_t txWriteAll(const void *buffer, size_t size) {
     const uint8_t *data = static_cast<const uint8_t *>(buffer);
     size_t total_written = 0;
@@ -108,7 +108,7 @@ size_t txWriteAll(const void *buffer, size_t size) {
             remaining, &bytes_written, kTxWriteTimeoutMs);
         tx_writes++;
         if (bytes_written > remaining) {
-            Serial.printf("[LOOPBACK] ERROR: impossible TX byte count %u > %u\\n",
+            Serial.printf("[LOOPBACK] ERROR: impossible TX byte count %u > %u\n",
                           (unsigned)bytes_written, (unsigned)remaining);
             tx_write_errors++;
             tx_stalled = true;
@@ -147,11 +147,11 @@ void transitionTo(AudioState new_state) {
     current_state = new_state;
     state_transitions++;
     last_transition_ms = millis();
-    Serial.printf("[LOOPBACK] Transition %s -> %s\\n", stateName(prev_state), stateName(new_state));
+    Serial.printf("[LOOPBACK] Transition %s -> %s\n", stateName(prev_state), stateName(new_state));
     uint32_t now = millis();
     if (new_state == AudioState::PLAYING) {
         Serial.println("[LOOPBACK] Playback started; RX remains active and will be discarded");
-        Serial.printf("[LOOPBACK] TX channel enabled: %s\\n", txEnabled() ? "yes" : "NO");
+        Serial.printf("[LOOPBACK] TX channel enabled: %s\n", txEnabled() ? "yes" : "NO");
         samples_played = 0;
         playback_start_ms = now;
         tx_stalled = false;
@@ -313,7 +313,7 @@ void loopbackTestLoop() {
             size_t rx_bytes = 0;
             esp_err_t rx_err = i2s_channel_read(
                 i2s.rxChan(), reinterpret_cast<char *>(rx_raw32), sizeof(rx_raw32),
-                &rx_bytes, pdMS_TO_TICKS(kTxWriteTimeoutMs));
+                &rx_bytes, kTxWriteTimeoutMs);
             rx_drain_reads++;
             if (rx_err == ESP_ERR_TIMEOUT) {
                 rx_read_timeouts++;
