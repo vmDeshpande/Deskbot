@@ -16,6 +16,10 @@
 #include "audio/loopback_test.h"
 #endif
 
+#ifdef DESKBOT_AUDIO_TX_DIAGNOSTIC
+#include "audio/tx_diagnostic.h"
+#endif
+
 void setup() {
   Serial.begin(115200);
 
@@ -45,6 +49,10 @@ void setup() {
 #ifdef DESKBOT_AUDIO_LOOPBACK_TEST
   DeskbotAudio::loopbackTestBegin();
 #endif
+
+#ifdef DESKBOT_AUDIO_TX_DIAGNOSTIC
+  DeskbotAudio::txDiagnosticBegin();
+#endif
 }
 
 void loop() {
@@ -60,6 +68,10 @@ void loop() {
 
 #ifdef DESKBOT_AUDIO_LOOPBACK_TEST
   DeskbotAudio::loopbackTestLoop();
+#endif
+
+#ifdef DESKBOT_AUDIO_TX_DIAGNOSTIC
+  DeskbotAudio::txDiagnosticLoop();
 #endif
 
   yield();
