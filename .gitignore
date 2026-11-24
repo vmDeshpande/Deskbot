@@ -27,3 +27,6 @@ htmlcov/
 # Common build output
 build/
 dist/
+
+# Vosk speech recognition models (large binary files, downloaded separately)
+server/models/

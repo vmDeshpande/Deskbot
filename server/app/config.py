@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     audio_channels: int = Field(default=1, ge=1, le=2)
     audio_format: str = "pcm_s16le"
     audio_chunk_timeout_s: float = Field(default=5.0, gt=0, le=60)
+    vosk_model_path: str = Field(default="", description="Path to Vosk speech recognition model directory")
 
     model_config = SettingsConfigDict(
         env_prefix="DESKBOT_",

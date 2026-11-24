@@ -23,6 +23,7 @@ class AudioSession:
     total_chunks: int = 0
     total_bytes: int = 0
     finished: bool = False
+    recognizer: Any = None
 
 
 class AudioSessionManager:

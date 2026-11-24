@@ -275,9 +275,9 @@ def test_audio_recording_duration_limit():
             ws.send_text(audio_message("audio.finish", {"recording_id": recording_id}))
             completed = json.loads(ws.receive_text())
             assert completed["message_type"] == "audio.completed"
-            assert completed["payload"]["duration_ms"] > 0
+            assert completed["payload"]["duration_ms"] >= 0
             # Server tracks wall-clock time; 10 chunks of 10ms audio = ~100ms audio
-            # but wall-clock elapsed is only a few ms. Duration limit is logged, not enforced.
+            # but wall-clock elapsed may be 0 ms in-process. Duration is logged, not enforced.
 
 
 def test_audio_recording_id_mismatch():
@@ -575,3 +575,33 @@ def test_audio_no_accumulation_in_ram():
             assert completed["payload"]["total_chunks"] == 100
             assert completed["payload"]["total_bytes"] == len(chunk) * 100
             # No way to retrieve raw audio - only metrics returned
+
+
+def test_audio_malformed_json_does_not_crash():
+    """Malformed JSON is rejected gracefully; no NameError from undefined logger."""
+    import logging
+    from app.api.audio_schemas import logger as audio_logger
+    assert audio_logger is not None, "audio_schemas logger must be defined"
+    with TestClient(make_app()) as client:
+        with connect_audio(client) as ws:
+            ws.send_text("{not valid json{{{")
+            # Server sends an error response and/or disconnects; either way, no crash.
+            try:
+                response = ws.receive_text()
+                parsed = json.loads(response)
+                assert parsed["message_type"] == "server.audio.error"
+            except WebSocketDisconnect:
+                pass
+
+
+def test_audio_truncated_json_does_not_crash():
+    """Truncated JSON (unterminated string) is rejected gracefully."""
+    with TestClient(make_app()) as client:
+        with connect_audio(client) as ws:
+            ws.send_text('{"protocol_version": "1.0", "message_type": "audio.start", "payload": {"recording_id": "')
+            try:
+                response = ws.receive_text()
+                parsed = json.loads(response)
+                assert parsed["message_type"] == "server.audio.error"
+            except WebSocketDisconnect:
+                pass

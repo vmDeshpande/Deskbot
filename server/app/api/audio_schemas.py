@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, TypeAlias
 from uuid import UUID
+
+logger = logging.getLogger(__name__)
 
 from pydantic import (
     AfterValidator,
@@ -152,6 +155,28 @@ class ServerAudioErrorMessage(MessageEnvelope):
     payload: AudioErrorPayload
 
 
+class AudioTranscriptionPayload(PayloadModel):
+    recording_id: UUID4
+    text: str
+    is_final: Literal[True] = True
+
+
+class AudioTranscriptionMessage(MessageEnvelope):
+    message_type: Literal["audio.transcription"]
+    payload: AudioTranscriptionPayload
+
+
+class AudioPartialPayload(PayloadModel):
+    recording_id: UUID4
+    text: str
+    is_final: Literal[False] = False
+
+
+class AudioPartialMessage(MessageEnvelope):
+    message_type: Literal["audio.partial"]
+    payload: AudioPartialPayload
+
+
 AudioMessage: TypeAlias = (
     AudioStartMessage
     | AudioStartedMessage
@@ -159,6 +184,8 @@ AudioMessage: TypeAlias = (
     | AudioCompletedMessage
     | AudioErrorMessage
     | ServerAudioErrorMessage
+    | AudioTranscriptionMessage
+    | AudioPartialMessage
 )
 
 AUDIO_MESSAGE_MODELS: dict[str, type[MessageEnvelope]] = {
@@ -168,6 +195,8 @@ AUDIO_MESSAGE_MODELS: dict[str, type[MessageEnvelope]] = {
     "audio.completed": AudioCompletedMessage,
     "audio.error": AudioErrorMessage,
     "server.audio.error": ServerAudioErrorMessage,
+    "audio.transcription": AudioTranscriptionMessage,
+    "audio.partial": AudioPartialMessage,
 }
 AUDIO_ENVELOPE_KEYS = {"protocol_version", "message_id", "message_type", "timestamp", "payload"}
 
@@ -240,6 +269,11 @@ def parse_audio_message(data: str | bytes, max_bytes: int = MAX_MESSAGE_BYTES) -
     except _DuplicateJSONKey as exc:
         raise AudioProtocolError("duplicate_json_key", 1007) from exc
     except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        logger.warning(
+            "event=invalid_json_received length=%d preview=%s",
+            len(text),
+            text[:200].replace("\n", "\\n").replace("\r", "\\r"),
+        )
         raise AudioProtocolError("invalid_json", 1007) from exc
 
     if not isinstance(raw, dict):

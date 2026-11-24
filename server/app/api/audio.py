@@ -1,8 +1,9 @@
-"""Authenticated Deskbot audio WebSocket endpoint."""
+"""Authenticated Deskbot audio WebSocket endpoint with Vosk streaming STT."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from uuid import UUID, uuid4
@@ -14,18 +15,31 @@ from app.api.audio_schemas import (
     AudioCompletedMessage,
     AudioErrorMessage,
     AudioFinishMessage,
+    AudioPartialMessage,
     AudioProtocolError,
     AudioStartMessage,
     AudioStartedMessage,
+    AudioTranscriptionMessage,
     ServerAudioErrorMessage,
     parse_audio_message,
     utc_timestamp,
 )
+from app.config import Settings
 from app.security.device_auth import parse_bearer_header, verify_device_token
 from app.services.audio_sessions import AudioSession, AudioSessionManager
 
 logger = logging.getLogger(__name__)
 AUDIO_SUBPROTOCOL = "deskbot.audio.v1"
+
+# Lazy Vosk import so the module loads even without vosk installed.
+try:
+    from vosk import Model, KaldiRecognizer
+
+    _VOSK_AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on environment
+    Model = None  # type: ignore[assignment, misc]
+    KaldiRecognizer = None  # type: ignore[assignment, misc]
+    _VOSK_AVAILABLE = False
 
 
 def _envelope(message_type: str, payload: dict) -> dict:
@@ -59,6 +73,29 @@ async def _close(websocket: WebSocket, code: int, reason: str) -> None:
         await websocket.close(code=code, reason=reason[:120])
     except (RuntimeError, OSError):
         pass
+
+
+def _load_vosk_recognizer(settings: Settings, sample_rate: int):
+    """Create a Vosk KaldiRecognizer if a model path is configured and available."""
+    if not _VOSK_AVAILABLE:
+        logger.warning("vosk package not installed; streaming STT disabled")
+        return None
+    model_path = settings.vosk_model_path
+    if not model_path:
+        logger.warning("vosk_model_path not configured; streaming STT disabled")
+        return None
+    try:
+        model = Model(model_path)
+        recognizer = KaldiRecognizer(model, sample_rate)
+        logger.info(
+            "event=vosk.recognizer_created sample_rate=%d model_path=%s",
+            sample_rate,
+            model_path,
+        )
+        return recognizer
+    except Exception as exc:
+        logger.warning("event=vosk.recognizer_creation_failed error=%s", exc)
+        return None
 
 
 async def audio_socket(websocket: WebSocket) -> None:
@@ -120,6 +157,49 @@ async def audio_socket(websocket: WebSocket) -> None:
                     await _close(websocket, 1008, "recording too long")
                     break
 
+                # Feed chunk into Vosk recognizer if available.
+                if session.recognizer is not None:
+                    try:
+                        is_final = session.recognizer.AcceptWaveform(chunk)
+                        if is_final:
+                            result = json.loads(session.recognizer.Result())
+                            text = result.get("text", "")
+                            if text:
+                                await _send_json(
+                                    websocket,
+                                    _envelope(
+                                        "audio.transcription",
+                                        {
+                                            "recording_id": session.recording_id,
+                                            "text": text,
+                                            "is_final": True,
+                                        },
+                                    ),
+                                    settings,
+                                )
+                        else:
+                            partial = json.loads(session.recognizer.PartialResult())
+                            partial_text = partial.get("partial", "")
+                            if partial_text:
+                                await _send_json(
+                                    websocket,
+                                    _envelope(
+                                        "audio.partial",
+                                        {
+                                            "recording_id": session.recording_id,
+                                            "text": partial_text,
+                                            "is_final": False,
+                                        },
+                                    ),
+                                    settings,
+                                )
+                    except Exception as exc:
+                        logger.warning(
+                            "event=vosk.processing_failed device_id=%s error=%s",
+                            session.device_id,
+                            exc,
+                        )
+
                 session.total_chunks += 1
                 session.total_bytes += len(chunk)
                 continue
@@ -164,6 +244,8 @@ async def audio_socket(websocket: WebSocket) -> None:
                     await _close(websocket, 1008, "invalid audio format")
                     break
 
+                recognizer = _load_vosk_recognizer(settings, message.payload.sample_rate)
+
                 session = await manager.start_recording(
                     device_id=authenticated_device_id,
                     recording_id=str(message.payload.recording_id),
@@ -172,6 +254,8 @@ async def audio_socket(websocket: WebSocket) -> None:
                     channels=message.payload.channels,
                     format=message.payload.format,
                 )
+                if recognizer is not None:
+                    session.recognizer = recognizer
                 recording_started = True
                 logger.info(
                     "event=audio.started device_id=%s recording_id=%s",
@@ -190,6 +274,7 @@ async def audio_socket(websocket: WebSocket) -> None:
                             "format": session.format,
                             "max_duration_s": settings.audio_max_duration_s,
                             "max_chunk_bytes": settings.audio_max_chunk_bytes,
+                            "vosk_enabled": recognizer is not None,
                         },
                     ),
                     settings,
@@ -214,6 +299,19 @@ async def audio_socket(websocket: WebSocket) -> None:
                     await _close(websocket, 1008, "recording ID mismatch or already finished")
                     break
 
+                # Finalize Vosk recognition.
+                transcription_text = ""
+                if session.recognizer is not None:
+                    try:
+                        final_result = json.loads(session.recognizer.FinalResult())
+                        transcription_text = final_result.get("text", "")
+                    except Exception as exc:
+                        logger.warning(
+                            "event=vosk.finalize_failed device_id=%s error=%s",
+                            session.device_id,
+                            exc,
+                        )
+
                 duration_ms = int((time.monotonic() - session.started_at) * 1000)
 
                 logger.info(
@@ -234,10 +332,25 @@ async def audio_socket(websocket: WebSocket) -> None:
                             "total_chunks": session.total_chunks,
                             "total_bytes": session.total_bytes,
                             "duration_ms": duration_ms,
+                            "text": transcription_text,
                         },
                     ),
                     settings,
                 )
+                # Send final transcription as a separate message for clarity.
+                if transcription_text:
+                    await _send_json(
+                        websocket,
+                        _envelope(
+                            "audio.transcription",
+                            {
+                                "recording_id": session.recording_id,
+                                "text": transcription_text,
+                                "is_final": True,
+                            },
+                        ),
+                        settings,
+                    )
                 continue
 
             await _close(websocket, 1008, "message direction is invalid")
