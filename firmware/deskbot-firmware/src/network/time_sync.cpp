@@ -2,6 +2,7 @@
 
 #include <time.h>
 #include <esp_sntp.h>
+#include "log.h"
 
 namespace DeskbotTime {
 namespace {
@@ -23,12 +24,12 @@ void loop(bool wifiConnected) {
   if (!started) {
     configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
     started = true;
-    Serial.println("[TIME] SNTP started; waiting for UTC synchronization.");
+    LOG_INFO("TIME", "SNTP started; waiting for sync");
   }
   if (!synchronized && time(nullptr) >= kMinimumValidEpoch &&
       sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
     synchronized = true;
-    Serial.println("[TIME] UTC clock synchronized.");
+    LOG_INFO("TIME", "UTC clock synchronized");
   }
 }
 

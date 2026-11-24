@@ -159,6 +159,12 @@ class AudioTranscriptionPayload(PayloadModel):
     recording_id: UUID4
     text: str
     is_final: Literal[True] = True
+    language: str | None = None
+    language_confidence: float | None = None
+    provider: str | None = None
+    provider_language: str | None = None
+    provider_language_probability: float | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class AudioTranscriptionMessage(MessageEnvelope):

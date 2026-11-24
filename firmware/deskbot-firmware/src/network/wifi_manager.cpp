@@ -2,6 +2,7 @@
 
 #include <WiFi.h>
 #include "secrets.h"
+#include "log.h"
 
 namespace DeskbotWiFi {
 namespace {
@@ -15,7 +16,7 @@ void begin() {
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
-  Serial.println("[WIFI] Connecting asynchronously...");
+  LOG_INFO("WIFI", "Connecting...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   started = true;
 }
@@ -27,14 +28,10 @@ void loop() {
   previousConnected = connected;
 
   if (connected) {
-    Serial.println("[WIFI] Connected.");
-    Serial.print("[WIFI] IP Address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("[WIFI] Signal Strength: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
+    LOG_INFO("WIFI", "Connected | %s", WiFi.localIP().toString().c_str());
+    LOG_DEBUG("WIFI", "Signal: %d dBm", WiFi.RSSI());
   } else {
-    Serial.println("[WIFI] Disconnected; waiting for Wi-Fi auto-reconnect.");
+    LOG_WARN("WIFI", "Disconnected; reconnecting...");
   }
 }
 

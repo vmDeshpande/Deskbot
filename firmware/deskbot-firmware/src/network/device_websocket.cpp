@@ -10,6 +10,7 @@
 #include "../protocol/deskbot_protocol.h"
 #include "time_sync.h"
 #include "secrets.h"
+#include "log.h"
 
 namespace DeskbotWebSocket {
 namespace {
@@ -123,8 +124,7 @@ void scheduleReconnect(uint32_t now) {
   const uint32_t delayMs = nextBackoffDelayMs();
   retryAtMs = now + delayMs;
   connectionState = ConnectionState::Backoff;
-  Serial.printf("[WS] Reconnect scheduled: delay_ms=%lu backoff=jittered\n",
-                static_cast<unsigned long>(delayMs));
+  LOG_DEBUG("WS", "Reconnect scheduled: delay_ms=%lu", static_cast<unsigned long>(delayMs));
 }
 
 bool sendBuffer(const char *buffer, size_t length) {
@@ -146,13 +146,13 @@ bool sendRegistration() {
   registrationSent = true;
   connectionState = ConnectionState::AwaitingRegistration;
   registrationDeadlineMs = millis() + 8000UL;
-  Serial.println("[WS] Registration sent; awaiting acknowledgement (timeout_ms=8000).");
+  LOG_DEBUG("WS", "Registration sent; awaiting ack");
   return true;
 }
 
 bool sendHeartbeat(uint32_t now) {
   if (heartbeatSequence == DeskbotProtocol::kMaximumSequence) {
-    Serial.println("[WS] Heartbeat sequence exhausted; reboot required.");
+    LOG_ERROR("WS", "Heartbeat sequence exhausted; reboot required");
     client.disconnect();
     return false;
   }
@@ -170,14 +170,13 @@ bool sendHeartbeat(uint32_t now) {
   waitingForHeartbeatAck = true;
   heartbeatAckDeadlineMs = now + kHeartbeatAckTimeoutMs;
   heartbeatAtMs = now + heartbeatIntervalMs;
-  Serial.printf("[WS] Heartbeat sent: sequence=%lu\n",
-                static_cast<unsigned long>(heartbeatSequence));
+  LOG_DEBUG("WS", "Heartbeat sent: sequence=%lu", static_cast<unsigned long>(heartbeatSequence));
   return true;
 }
 
 bool sendStatus(uint32_t now) {
   if (statusSequence == DeskbotProtocol::kMaximumSequence) {
-    Serial.println("[WS] Status sequence exhausted; reboot required.");
+    LOG_ERROR("WS", "Status sequence exhausted; reboot required");
     client.disconnect();
     return false;
   }
@@ -215,46 +214,44 @@ void handleIncomingMessage(uint32_t now) {
   if (!DeskbotProtocol::parseServerMessage(receiveBuffer, receiveLength,
                                            DESKBOT_DEVICE_ID, expectedId,
                                            expectedSequence, message)) {
-    Serial.println("[WS] Invalid or unsupported server message; closing session.");
+    LOG_ERROR("WS", "Invalid server message; closing session");
     protocolFault = true;
     return;
   }
 
   if (message.kind == DeskbotProtocol::ServerMessageKind::Registered) {
     if (!registrationSent || registered) {
-      Serial.println("[WS] Unexpected registration acknowledgement; closing session.");
+      LOG_ERROR("WS", "Unexpected registration ack; closing session");
       protocolFault = true;
       return;
     }
-    Serial.println("[WS] Registration acknowledgement received.");
     registered = true;
     connectionState = ConnectionState::Registered;
     registeredAtMs = now;
     heartbeatIntervalMs = static_cast<uint32_t>(message.heartbeatIntervalSeconds) * 1000UL;
     heartbeatAtMs = now;  // First heartbeat is sent immediately after registration.
     statusAtMs = now;     // Report the initial idle state only after registration.
-    Serial.println("[WS] Device registered with backend.");
+    LOG_INFO("SERVER", "Device registered");
     return;
   }
 
   if (!registered) {
-    Serial.println("[WS] Unexpected server message before registration; closing session.");
+    LOG_ERROR("WS", "Unexpected server message before registration; closing session");
     protocolFault = true;
     return;
   }
   if (message.kind == DeskbotProtocol::ServerMessageKind::HeartbeatAck) {
-    Serial.printf("[WS] Heartbeat acknowledgement received: sequence=%lu\n",
-                  static_cast<unsigned long>(message.sequence));
+    LOG_DEBUG("WS", "Heartbeat ack: sequence=%lu", static_cast<unsigned long>(message.sequence));
     waitingForHeartbeatAck = false;
     return;
   }
   if (message.kind == DeskbotProtocol::ServerMessageKind::Ping) {
-    Serial.println("[WS] Server application ping received.");
+    LOG_INFO("WS", "Server ping received");
     if (!sendPong(message)) {
-      Serial.println("[WS] Server ping response failed; closing session.");
+      LOG_ERROR("WS", "Ping response failed; closing session");
       protocolFault = true;
     } else {
-      Serial.println("[WS] Server application pong sent.");
+      LOG_DEBUG("WS", "Pong sent");
     }
   }
 }
@@ -268,25 +265,13 @@ void handleLibraryEvent(WStype_t type, uint8_t *payload, size_t length) {
       registrationSent = false;
       registered = false;
       waitingForHeartbeatAck = false;
-      Serial.printf("[WS] Transport connected: attempt=%lu connected_callback_ever_reached=true; sending registration next.\n",
-                    static_cast<unsigned long>(connectionAttemptCount));
+      LOG_DEBUG("WS", "Transport connected (attempt=%lu)", static_cast<unsigned long>(connectionAttemptCount));
       break;
 
     case WStype_DISCONNECTED: {
       char safeReason[kDisconnectReasonBufferSize] = {};
       formatSafeDisconnectReason(payload, length, safeReason, sizeof(safeReason));
-      Serial.printf(
-          "[WS] Transport disconnected: event=WStype_DISCONNECTED(%d) "
-          "transport_connected=%s registered=%s registration_pending=%s "
-          "heartbeat_pending=%s attempt=%lu connected_callback_ever_reached=%s "
-          "reason=%s payload_len=%lu\n",
-          static_cast<int>(type), transportConnected ? "true" : "false",
-          registered ? "true" : "false",
-          (registrationSent && !registered) ? "true" : "false",
-          waitingForHeartbeatAck ? "true" : "false",
-          static_cast<unsigned long>(connectionAttemptCount),
-          connectedCallbackEverReached ? "true" : "false", safeReason,
-          static_cast<unsigned long>(length));
+      LOG_WARN("WS", "Disconnected: %s", safeReason);
       if (transportConnected) disconnectedActiveSession = true;
       transportConnected = false;
       connectionState = ConnectionState::Backoff;
@@ -300,7 +285,7 @@ void handleLibraryEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_TEXT:
       if (payload == nullptr || length == 0 ||
           length > DeskbotProtocol::kMaximumMessageBytes || receivedPending) {
-        Serial.println("[WS] Invalid or unexpected text frame; closing session.");
+        LOG_ERROR("WS", "Invalid text frame; closing session");
         protocolFault = true;
         break;
       }
@@ -315,15 +300,12 @@ void handleLibraryEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_FRAGMENT_BIN_START:
     case WStype_FRAGMENT:
     case WStype_FRAGMENT_FIN:
-      Serial.printf("[WS] Invalid or unsupported WebSocket frame: event=%d; closing session.\n",
-                    static_cast<int>(type));
+      LOG_ERROR("WS", "Unsupported frame type: %d", static_cast<int>(type));
       protocolFault = true;
       break;
 
     case WStype_ERROR:
-      Serial.printf(
-          "[WS] WebSocket error event: event=WStype_ERROR(%d) payload_len=%lu.\n",
-          static_cast<int>(type), static_cast<unsigned long>(length));
+      LOG_WARN("WS", "Error event: payload_len=%lu", static_cast<unsigned long>(length));
       break;
 
     case WStype_PING:
@@ -350,7 +332,7 @@ void begin() {
       DESKBOT_WS_PORT == 0 || DESKBOT_WS_PATH[0] != '/' ||
       !DeskbotProtocol::isUuidV4(DESKBOT_DEVICE_ID) ||
       !DeskbotProtocol::isBearerTokenValid(DESKBOT_DEVICE_TOKEN)) {
-    Serial.println("[WS] Configuration incomplete; set host, device UUID, and token in ignored secrets.h.");
+    LOG_ERROR("WS", "Configuration incomplete; check secrets.h");
     return;
   }
 
@@ -370,10 +352,10 @@ void begin() {
   if (taskCreated != pdPASS) {
     configured = false;
     connectionState = ConnectionState::ConfigurationInvalid;
-    Serial.println("[WS] Could not start the network worker task.");
+    LOG_ERROR("WS", "Could not start network worker task");
     return;
   }
-  Serial.println("[WS] Client configured for deskbot.v1.");
+  LOG_INFO("WS", "Client configured");
 }
 
 void loop(bool wifiConnected, bool clockSynchronized) {
@@ -392,7 +374,7 @@ void loop(bool wifiConnected, bool clockSynchronized) {
   if (!bootIdReady) {
     bootIdReady = DeskbotProtocol::makeUuidV4(bootId);
     if (!bootIdReady) {
-      Serial.println("[WS] Could not create boot identity.");
+      LOG_ERROR("WS", "Could not create boot identity");
       return;
     }
   }
@@ -420,8 +402,7 @@ void loop(bool wifiConnected, bool clockSynchronized) {
     connectionState = ConnectionState::Connecting;
     retryAtMs = now + nextBackoffDelayMs();
     ++connectionAttemptCount;
-    Serial.printf("[WS] Starting connection attempt=%lu.\n",
-                  static_cast<unsigned long>(connectionAttemptCount));
+    LOG_DEBUG("WS", "Connection attempt=%lu", static_cast<unsigned long>(connectionAttemptCount));
     // client.loop() already called above; it will initiate the TCP connection.
   } else if (!client.isConnected()) {
     connectionState = ConnectionState::Backoff;
@@ -436,7 +417,7 @@ void loop(bool wifiConnected, bool clockSynchronized) {
   const uint32_t afterClientLoop = millis();
   if (protocolFault) {
     protocolFault = false;
-    Serial.println("[WS] Invalid or unsupported server message; closing session.");
+    LOG_ERROR("WS", "Invalid server message; closing session");
     client.disconnect();
     return;
   }
@@ -450,14 +431,14 @@ void loop(bool wifiConnected, bool clockSynchronized) {
 
   if (registered && waitingForHeartbeatAck &&
       timeReached(afterClientLoop, heartbeatAckDeadlineMs)) {
-    Serial.println("[WS] Heartbeat acknowledgement timed out; reconnecting.");
+    LOG_WARN("WS", "Heartbeat ack timeout; reconnecting");
     client.disconnect();
     return;
   }
 
   if (registrationSent && !registered &&
       timeReached(afterClientLoop, registrationDeadlineMs)) {
-    Serial.println("[WS] Registration acknowledgement timeout; reconnecting.");
+    LOG_WARN("WS", "Registration ack timeout; reconnecting");
     client.disconnect();
     return;
   }
@@ -466,7 +447,7 @@ void loop(bool wifiConnected, bool clockSynchronized) {
   // (signaled by WStype_CONNECTED -> transportConnected == true).
   if (client.isConnected() && transportConnected && !registrationSent) {
     if (!sendRegistration()) {
-      Serial.println("[WS] Registration send failed.");
+      LOG_ERROR("WS", "Registration send failed");
       client.disconnect();
       return;
     }

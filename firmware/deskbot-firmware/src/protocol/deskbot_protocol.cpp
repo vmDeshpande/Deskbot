@@ -4,6 +4,8 @@
 #include <esp_system.h>
 #include <time.h>
 
+#include "log.h"
+
 namespace DeskbotProtocol {
 namespace {
 
@@ -216,19 +218,30 @@ bool buildPong(const char *replyTo, const char *nonce, char *output,
 }
 
 bool parseServerMessage(char *input, size_t length, const char *deviceId,
-                        const char *expectedHeartbeatId,
-                        uint32_t expectedHeartbeatSequence,
-                        ServerMessage &message) {
+                         const char *expectedHeartbeatId,
+                         uint32_t expectedHeartbeatSequence,
+                         ServerMessage &message) {
   message = ServerMessage{};
   if (input == nullptr || length == 0 || length > kMaximumMessageBytes ||
       deviceId == nullptr) {
     return false;
   }
 
+  LOG_DEBUG("WS", "Parsing server message: len=%u free_heap=%lu", (unsigned int)length, (unsigned long)ESP.getFreeHeap());
+
   StaticJsonDocument<kJsonDocumentCapacity> document;
   const DeserializationError error = deserializeJson(
       document, input, length, DeserializationOption::NestingLimit(8));
-  if (error || !document.is<JsonObject>()) return false;
+  if (error) {
+      LOG_ERROR("WS", "JSON parse failed: %s (len=%u, free_heap=%lu)", error.c_str(), (unsigned int)length, (unsigned long)ESP.getFreeHeap());
+      return false;
+  }
+  if (!document.is<JsonObject>()) {
+      LOG_ERROR("WS", "Root is not object (len=%u)", (unsigned int)length);
+      return false;
+  }
+
+  LOG_DEBUG("WS", "Parsed OK: doc_size=%u free_heap=%lu", (unsigned int)document.memoryUsage(), (unsigned long)ESP.getFreeHeap());
 
   JsonObjectConst envelope = document.as<JsonObjectConst>();
   static constexpr const char *envelopeKeys[] = {
